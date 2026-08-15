@@ -1,4 +1,4 @@
-# @dsh-kit/agent-memory bundle layer — applied when a profile lists this bundle
+# dsh-evolving-memory bundle layer — applied when a profile lists this bundle
 # (package.json declares `dsh.bundle.patch` pointing at this file).
 #
 # `name` is a PACKAGE NAME (resolved through the profile's node_modules or the
@@ -7,4 +7,4 @@
 # is visible to every descendant plugin that injects `['memory']`.
 - insert:
     - id: agent-memory
-      name: '@dsh-kit/agent-memory'
+      name: 'dsh-evolving-memory'

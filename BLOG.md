@@ -33,7 +33,7 @@ request/header（完整请求快照） · fork/resume 谱系（parentSession / s
 
 ## 三、设计：捕获 → 梦境 → 检索注入 → 进化
 
-`@dsh-kit/agent-memory` 围绕一个闭环设计：
+`dsh-evolving-memory` 围绕一个闭环设计：
 
 ```
 Capture（捕获）      Dream（梦境整合）       Retrieve（检索注入）      Evolve（进化）
@@ -114,7 +114,7 @@ stats: { total: 2, active: 1, archived: 1, correctionCount: 1, medianConfidence:
 - **v0.3**：Web UI 记忆面板（"我眼中的你"可视化）、多 agent 共享、向量检索可选后端
 - **生态**：推动 DSH 官方开放插件事件注册面，让记忆事件也能进会话日志
 
-**记忆不是功能，是基础设施。** 我们希望 `@dsh-kit/agent-memory` 成为 DSH 生态的记忆标准缝——如果你在 DSH 上做记忆相关的事情，欢迎来 [讨论帖](https://github.com/deepseek-ai/deepseek-harness/discussions/2061) 交流。
+**记忆不是功能，是基础设施。** 我们希望 `dsh-evolving-memory` 成为 DSH 生态的记忆标准缝——如果你在 DSH 上做记忆相关的事情，欢迎来 [讨论帖](https://github.com/deepseek-ai/deepseek-harness/discussions/2061) 交流。
 
 ---
 

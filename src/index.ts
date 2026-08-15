@@ -1,5 +1,5 @@
 /**
- * `@dsh-kit/agent-memory` — self-evolving memory for DeepSeek Harness.
+ * `dsh-evolving-memory` — self-evolving memory for DeepSeek Harness.
  *
  * Mounts the `ctx.memory` service (capture → dream consolidation → retrieval
  * injection → evolve) and seven model tools. Everything is registered through

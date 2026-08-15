@@ -1,5 +1,5 @@
 {
-  "name": "@dsh-kit/agent-memory",
+  "name": "dsh-evolving-memory",
   "version": "0.1.0",
   "description": "Self-evolving memory for DeepSeek Harness: capture → dream consolidation → retrieval injection → evolve. User profile, project memory, correction learning, resume narrative, and a nightly 'dream' pass over the replayable session log. 自进化记忆：捕获 → 梦境整合 → 检索注入 → 进化，越用越懂用户与项目。",
   "license": "MIT",

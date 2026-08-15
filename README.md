@@ -1,4 +1,4 @@
-# @dsh-kit/agent-memory
+# dsh-evolving-memory
 
 **Self-evolving memory for DeepSeek Harness — 越用越懂用户与项目的自进化记忆插件**
 
@@ -17,7 +17,7 @@ A first-party-grade memory seam for DSH: capture → dream consolidation → ret
 ## Install / 安装
 
 ```sh
-dsh plugin --profile web add @dsh-kit/agent-memory
+dsh plugin --profile web add dsh-evolving-memory
 dsh --profile web
 ```
 

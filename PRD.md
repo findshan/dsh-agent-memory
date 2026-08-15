@@ -1,4 +1,4 @@
-# PRD：DSH 自进化记忆插件 `@dsh-kit/agent-memory`
+# PRD：DSH 自进化记忆插件 `dsh-evolving-memory`
 
 > 版本：v0.1.0-draft · 作者：DSH Kit (findshan) · 状态：三路调研完成，方向成立，进入开发
 > 依据：`research/00-research-synthesis.md`（综合）、`01-competitor-memory-mechanisms.md`（竞品）、`02-memory-architectures-and-papers.md`（架构/论文）、`mechanism-verification.md`（DSH 机制验证）、`03-dsh-ecosystem-and-official-seams.md`（生态）
@@ -212,7 +212,7 @@ interface MemoryRecord {
 
 - peer：`@deepseek-ai/cordis ^4.0.1`、`@deepseek-ai/dsh-tools`（next 线）、`@deepseek-ai/dsh-system-prompt`、`@deepseek-ai/dsh-storage*`（可选，缺省降级文件存储）
 - 零原生依赖（BM25 自实现；不引入向量库）
-- 分发：`dsh.bundle` + `cordis.patch.yml`；安装 `dsh plugin --profile <name> add @dsh-kit/agent-memory`
+- 分发：`dsh.bundle` + `cordis.patch.yml`；安装 `dsh plugin --profile <name> add dsh-evolving-memory`
 
 ## 8. 测试验收标准
 
@@ -238,7 +238,7 @@ interface MemoryRecord {
 ## 10. 发布计划
 
 1. 开发 + 全量测试（含真实 DSH profile 加载验证）
-2. GitHub `findshan/dsh-agent-memory`（MIT、`dsh-plugin` topic、`dsh` 字段）+ npm `@dsh-kit/agent-memory`
+2. GitHub `findshan/dsh-agent-memory`（MIT、`dsh-plugin` topic、`dsh` 字段）+ npm `dsh-evolving-memory`
 3. deepseek-harness Discussions Show & Tell（中英双语：为什么记忆是 DSH 下一块拼图、DSH 日志优势、Dream 机制落地）
 4. dsh.so 注册表收录
 5. 缓存插件 (dsh-unified-cache) 作为 v0.2 的基座组件（检索缓存/热数据提升）另行评估

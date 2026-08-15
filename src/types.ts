@@ -1,5 +1,5 @@
 /**
- * Public types for `@dsh-kit/agent-memory`.
+ * Public types for `dsh-evolving-memory`.
  *
  * A memory is a durable belief with provenance. All values are plain JSON so
  * the store stays human-readable and portable.
