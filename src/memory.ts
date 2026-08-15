@@ -357,7 +357,7 @@ export class MemoryService extends Service {
   private feed(feed: SessionFeed): void {
     const { type, data } = feed.event
     if (type === 'user/message') {
-      const text = extractText(data.content)
+      const text = stripSystemReminders(extractText(data.content))
       if (text.length === 0) return
       this.sessionsSinceDream.add(feed.id)
       this.activityBuffer.push({ sessionId: feed.id, line: truncate(`用户: ${text}`, 120), at: Date.now() })
@@ -451,6 +451,13 @@ export class MemoryService extends Service {
       text: parts.join('\n\n'),
     })
   }
+}
+
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g
+
+/** Strip `<system-reminder>` blocks that DSH injects into user-message content. */
+function stripSystemReminders(text: string): string {
+  return text.replace(SYSTEM_REMINDER_RE, ' ').replace(/\s+/g, ' ').trim()
 }
 
 function extractText(content: unknown): string {

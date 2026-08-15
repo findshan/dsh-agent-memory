@@ -96,6 +96,37 @@ async function main() {
   assert.ok(reloaded.some(r => r.content.includes('npm')), 'memories survive restart')
   await unmount(second.fiber)
 
+  // ── capture hygiene: injected system-reminder noise never becomes memory ─
+  {
+    const ctx = new Context()
+    ctx.provide('tools', toolsStub)
+    ctx.provide('systemPrompt', systemPromptStub)
+    const fiber = ctx.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, autoCapture: true })
+    await fiber
+    const memory = ctx.get('memory')
+
+    // DSH injects the skill catalog as a <system-reminder> block inside the
+    // user-message content; the catalog text contains phrases like
+    // "不要用 ffmpeg" that the correction patterns would otherwise match.
+    const reminderText = [
+      '<system-reminder>',
+      'A skill is a reusable set of task-specific instructions.',
+      '`lark-minutes`: 本地音视频转纪要优先走本 skill，不要用 ffmpeg/whisper 本地转写。',
+      '</system-reminder>',
+      '以后记得我用 yarn 而不是 npm',
+    ].join('\n')
+    ctx.emit('session/event', { id: 'session-capture-test' }, {
+      type: 'user/message',
+      data: { content: [{ type: 'text', text: reminderText }] },
+    })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const recs = await memory.list({ scope: 'user' })
+    const noise = recs.filter(r => r.content.includes('system-reminder') || r.content.includes('ffmpeg'))
+    assert.equal(noise.length, 0, 'system-reminder text must never be captured')
+    assert.ok(recs.some(r => r.content.includes('yarn')), 'real user correction after reminder is still captured')
+    await fiber.dispose()
+  }
+
   // ── repeated mount/unmount stability (hot reload hygiene) ───────────────
   for (let i = 0; i < 10; i += 1) {
     const cycle = await mount(dir)
