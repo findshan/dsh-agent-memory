@@ -36,7 +36,10 @@ export function buildDreamPrompt(files: Array<{ label: string; text: string }>):
     '4. 只输出 JSON：{"files": {"user": "...", "agent": "...", "memory": "...", "project": "..."}, "report": "本次整合的变更说明（合并/删除/新增，中文，3-6 行）"}',
     '   未变更的文件省略；每个文件内容以 # 标题开头。\n']
   for (const file of files) {
-    if (file.text.trim().length > 0) parts.push(`===== ${file.label} =====\n${cap(file.text, 3000)}`)
+    if (file.text.trim().length > 0) {
+      const capChars = file.label.startsWith('daily/') ? 8000 : 3000
+      parts.push(`===== ${file.label} =====\n${cap(file.text, capChars)}`)
+    }
   }
   return parts.join('\n\n')
 }
