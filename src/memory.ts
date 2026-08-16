@@ -39,6 +39,7 @@ const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g
 const SOFT_CONVENTION = '关于用户本人的写 user.md；关于当前项目的写 project.md；时间事件进 daily/；其余（包括拿不准的）写 memory.md。'
 
 const GUIDANCE = `记忆系统：以下是你（agent）与用户的共享记忆，按文件组织。${SOFT_CONVENTION}
+记忆工具只有 6 个：memory_search / memory_read / memory_catalog / memory_save / memory_correct / memory_dream。旧版工具名（memory_profile / memory_list / memory_confirm / memory_forget）已废弃，调用会报错，不要使用。
 用 memory_search 查找（返回命中文件/小节/片段），觉得相关再用 memory_read 展开全文或小节；memory_catalog 查看完整目录。记忆由廉价模型在后台自动提取与整合（dream），你也可以主动触发 memory_dream。`
 
 /** Resolve the memory root from config or `$DSH_HOME/memory`. */
