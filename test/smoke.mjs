@@ -84,11 +84,13 @@ async function main() {
   assert.ok(catalog.includes('memory.md'), 'catalog lists memory.md')
   assert.ok(catalog.length < 2000, 'catalog stays small')
 
-  // ── injection: systemPrompt.section mounted with catalog ────────────────
+  // ── injection: systemPrompt.section mounted once with a text provider ────
   const injected = sections.find(s => s.name === 'memory')
   assert.ok(injected !== undefined, 'memory section injected')
   assert.ok(injected.order === 116, 'injection order 116')
-  assert.ok(injected.text.includes('memory_search'), 'guidance mentions tools')
+  const injectedText = typeof injected.text === 'function' ? injected.text() : injected.text
+  assert.ok(injectedText.includes('memory_search'), 'guidance mentions tools')
+  assert.ok(injectedText.includes('user.md'), 'catalog present in injected text')
 
   // ── correction learning (file semantics) ─────────────────────────────────
   memory.correct('pnpm', '用户现在改用 npm 而不是 pnpm')

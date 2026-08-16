@@ -86,6 +86,7 @@ export class MemoryService extends Service {
   private sessionsSinceDream = new Set<string>()
   private sessionCompacted = new Set<string>()
   private activityBuffer: Array<{ sessionId: string; line: string }> = []
+  private sectionRegistered = false
 
   constructor(ctx: Context, config: ResolvedMemoryConfig) {
     super(ctx, 'memory')
@@ -99,8 +100,8 @@ export class MemoryService extends Service {
     this.dreamCount = meta.dreamCount
     this.rebuildIndex()
     this.observeSessions()
-    this.scheduleDream()
     this.injectCatalog()
+    this.scheduleDream()
   }
 
   // ── public API ────────────────────────────────────────────────────────────
@@ -111,7 +112,6 @@ export class MemoryService extends Service {
     const title = firstLine(body) || '记录'
     this.store.upsertSection(target, title, body)
     this.rebuildIndex()
-    this.injectCatalog()
     return { target, title }
   }
 
@@ -121,7 +121,6 @@ export class MemoryService extends Service {
     const title = firstLine(body) || '记录'
     this.store.upsertSection('daily', title, body, date ?? today())
     this.rebuildIndex()
-    this.injectCatalog()
   }
 
   /** BM25 search across every memory document (daily supports date range). */
@@ -170,8 +169,7 @@ export class MemoryService extends Service {
         if (haystack.includes(match) || this.bm25Matches(section.body, match)) {
           this.store.upsertSection(target, section.title, newContent.trim())
           this.rebuildIndex()
-          this.injectCatalog()
-          return true
+                return true
         }
       }
     }
@@ -218,8 +216,7 @@ export class MemoryService extends Service {
       this.sessionsSinceDream.clear()
       this.writeMeta()
       this.rebuildIndex()
-      this.injectCatalog()
-      return { ran: true, ranAt: now, reason: 'consolidated', changed, report }
+        return { ran: true, ranAt: now, reason: 'consolidated', changed, report }
     } catch (error) {
       return { ran: false, ranAt: now, reason: `dream failed: ${String(error)}`, changed: [] }
     } finally {
@@ -289,8 +286,7 @@ export class MemoryService extends Service {
           if (this.config.autoExtract && isCorrection(text)) {
             this.store.appendToSection('user', '偏好', stripSystemReminders(text))
             this.rebuildIndex()
-            this.injectCatalog()
-          }
+                  }
         }
       } else if (type === 'session/disposed') {
         if (!this.sessionCompacted.has(sessionId) && this.config.autoExtract && this.backend !== null) {
@@ -319,8 +315,7 @@ export class MemoryService extends Service {
       if (entry.length === 0) return
       this.store.appendBlock('daily', '会话纪要', `- [${new Date().toISOString().slice(11, 16)}] ${entry.replace(/\n/g, '\n  ')}`)
       this.rebuildIndex()
-      this.injectCatalog()
-    } catch {
+      } catch {
       // extraction is best-effort; memory read/write never depends on it
     }
   }
@@ -382,17 +377,30 @@ export class MemoryService extends Service {
     this.disposers.push(dispose)
   }
 
-  /** Standing injection: guidance + deterministic catalog + today's points. */
+  /**
+   * Standing injection: register ONCE with a text provider evaluated at
+   * every assembly (guidance + deterministic catalog + today's points), so
+   * the prompt stays fresh without re-registering the section.
+   */
   private injectCatalog(): void {
     const systemPrompt = this.ctx.get('systemPrompt') as
-      | { section?: (opts: { name: string; order: number; text: string }) => void }
+      | { section?: (opts: { name: string; order: number; text: string | (() => string) }) => void }
       | undefined
-    if (systemPrompt?.section === undefined) return
+    if (systemPrompt?.section === undefined || this.sectionRegistered) return
+    this.sectionRegistered = true
+    systemPrompt.section({
+      name: 'memory',
+      order: 116,
+      text: () => this.catalogText(),
+    })
+  }
+
+  /** Compose the current catalog + today's points (evaluated per assembly). */
+  private catalogText(): string {
     const budget = this.config.catalogBudgetTokens * 4
     const todayPoints = this.store.todayPoints(Math.floor(budget * 0.15))
     const catalog = this.store.catalog(this.config.catalogTopN, Math.floor(budget * 0.85))
-    const text = `${GUIDANCE}\n\n${catalog}${todayPoints.length > 0 ? `\n${todayPoints}` : ''}`
-    systemPrompt.section({ name: 'memory', order: 116, text })
+    return `${GUIDANCE}\n\n${catalog}${todayPoints.length > 0 ? `\n${todayPoints}` : ''}`
   }
 
   // ── meta persistence ───────────────────────────────────────────────────────
