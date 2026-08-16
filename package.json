@@ -1,7 +1,7 @@
 {
   "name": "dsh-evolving-memory",
-  "version": "0.1.1",
-  "description": "Self-evolving memory for DeepSeek Harness: capture → dream consolidation → retrieval injection → evolve. User profile, project memory, correction learning, resume narrative, and a nightly 'dream' pass over the replayable session log. 自进化记忆：捕获 → 梦境整合 → 检索注入 → 进化，越用越懂用户与项目。",
+  "version": "0.2.0",
+  "description": "File-based self-evolving memory for DeepSeek Harness v2: compression & extraction over official compaction, daily episodic layer, dream consolidation to semantic files (user/agent/memory/dream + project), catalog disclosure injection, no confidence machine. 文件化自进化记忆：消费官方 compact 压缩提取，每日情景层 + 梦境整合固化语义，目录式披露注入，无置信度体系。",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

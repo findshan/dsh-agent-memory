@@ -1,109 +1,72 @@
 /**
- * Public types for `dsh-evolving-memory`.
+ * Public types for `dsh-evolving-memory` v2.
  *
- * A memory is a durable belief with provenance. All values are plain JSON so
- * the store stays human-readable and portable.
+ * v2 is file-based: memory lives in human-readable Markdown documents
+ * (user.md / agent.md / memory.md / dream.md / projects/<p>/project.md plus
+ * the daily/ time layer). The system does no classification — a soft
+ * convention in the extraction prompt tells the model where to write, and
+ * BM25 retrieval is the correctness backstop.
  * @module
  */
 
-/** Memory scope: who the belief applies to. */
-export type MemoryScope = 'user' | 'project' | 'session' | 'global'
+/** Memory file targets the tools and service expose. */
+export type MemoryTarget = 'user' | 'agent' | 'memory' | 'project' | 'dream' | 'daily'
 
-/** Memory kind: what kind of belief it is. */
-export type MemoryKind = 'fact' | 'preference' | 'decision' | 'lesson'
-
-/** Lifecycle status. Writes land as `suggested`; human confirmation promotes to `active`. */
-export type MemoryStatus = 'suggested' | 'active' | 'archived'
-
-/** Provenance pointer into the replayable session log (DSH unique asset). */
-export interface MemorySource {
-  /** Session that produced the belief. */
-  sessionId: string
-  /** Contiguous event range (seq) supporting the belief. */
-  seqRange: [number, number]
+/** Input config — every field optional; defaults applied by `resolveConfig`. */
+export interface MemoryConfig {
+  memoryDir?: string
+  dreamIntervalHours?: number
+  dreamMinSessions?: number
+  /** Cheap model used for extraction and dream consolidation. */
+  model?: string
+  /** API key for the cheap model; defaults to `DEEPSEEK_API_KEY` env. */
+  apiKey?: string
+  baseURL?: string
+  /** Standing injection budget for the memory catalog. */
+  catalogBudgetTokens?: number
+  /** Catalog lines shown per file (first lines of the top-N sections). */
+  catalogTopN?: number
+  searchTopK?: number
+  /** Consume `compaction/summary` events and extract into daily/. */
+  autoExtract?: boolean
+  /** Keep daily files this many days before archiving during dream. */
+  dailyRetentionDays?: number
 }
 
-/** One durable belief. */
-export interface MemoryRecord {
-  id: string
-  content: string
-  scope: MemoryScope
-  kind: MemoryKind
-  /** 0-1, updated by evidence (corrections, confirmations, adoption feedback). */
-  confidence: number
-  /** 0-1, drives injection priority. */
-  importance: number
-  status: MemoryStatus
-  source?: MemorySource
-  /** When a newer belief supersedes this one, the older record points at it. History is kept. */
-  supersededBy?: string
-  createdAt: number
-  updatedAt: number
+/** Fully resolved config with every default materialized. */
+export interface ResolvedMemoryConfig {
+  memoryDir: string
+  dreamIntervalHours: number
+  dreamMinSessions: number
+  model: string
+  apiKey: string
+  baseURL: string
+  catalogBudgetTokens: number
+  catalogTopN: number
+  searchTopK: number
+  autoExtract: boolean
+  dailyRetentionDays: number
 }
 
-/** A scored recall hit. */
+/** One `## `-headed section of a memory document. */
+export interface MemorySection {
+  title: string
+  body: string
+}
+
+/** A search hit across the memory documents. */
 export interface MemoryHit {
-  record: MemoryRecord
+  target: string
+  section: string
+  snippet: string
   score: number
 }
 
-/** Operational counters. */
-export interface MemoryStats {
-  total: number
-  byScope: Record<MemoryScope, number>
-  byStatus: Record<MemoryStatus, number>
-  byKind: Record<MemoryKind, number>
-  suggestedPending: number
-  /** Median confidence of active records. */
-  medianConfidence: number
-  lastDreamAt: number | null
-  dreamCount: number
-  correctionCount: number
-}
-
-/** Result of a dream pass. */
+/** Dream run report. */
 export interface DreamReport {
+  ran: boolean
   ranAt: number
-  sessionsScanned: number
-  candidates: number
-  merged: number
-  superseded: number
-  archived: number
-  digestProduced: boolean
-  error?: string
-}
-
-/** Input to remember(). */
-export interface RememberInput {
-  content: string
-  scope?: MemoryScope
-  kind?: MemoryKind
-  importance?: number
-  source?: MemorySource
-  /** Corrections supersede conflicting beliefs and auto-apply. */
-  correction?: boolean
-}
-
-/** Plugin configuration input (schemastery-validated; every field optional). */
-export interface MemoryConfig {
-  memoryDir?: string
-  profileBudgetTokens?: number
-  dreamIntervalHours?: number
-  dreamMinSessions?: number
-  dreamUseCheapModel?: boolean
-  searchTopK?: number
-  autoCapture?: boolean
-  snapshotBudgetChars?: number
-}
-
-/** Fully resolved configuration after defaults are applied. */
-export interface ResolvedMemoryConfig {
-  memoryDir: string
-  profileBudgetTokens: number
-  dreamIntervalHours: number
-  dreamMinSessions: number
-  dreamUseCheapModel: boolean
-  searchTopK: number
-  autoCapture: boolean
-  snapshotBudgetChars: number
+  reason: string
+  changed: string[]
+  report?: string
 }

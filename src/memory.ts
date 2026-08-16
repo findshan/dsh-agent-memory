@@ -1,55 +1,45 @@
 /**
- * `ctx.memory` — the self-evolving memory service.
+ * `ctx.memory` — the file-based self-evolving memory service (v2).
  *
- * A memory is a durable belief with provenance (`source` points into the
- * replayable session log). Learning is belief revision: corrections supersede
- * conflicting beliefs, confirmations raise confidence, and the background
- * "dream" pass consolidates accumulated evidence (merge, dedupe, prune,
- * digest) while the user is away.
+ * Pipeline: official compaction summaries (T1) → extraction into the daily
+ * time layer (T2) → dream consolidation from episodic to semantic (T3).
+ * Injection is a bounded deterministic catalog (skill pattern); content is
+ * disclosed on demand through search/read. No confidence, no status machine,
+ * no classification logic — a soft convention in prompts tells the model
+ * where to write, and BM25 retrieval is the correctness backstop.
  * @module
  */
 
-import { randomUUID } from 'node:crypto'
+import { Service, type Context } from '@deepseek-ai/cordis'
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { Service, type Context } from '@deepseek-ai/cordis'
 import { Bm25Index } from './bm25.js'
-import { JsonMemStore, type MemStore } from './store.js'
+import { completeJson, createBackend, type ModelBackend } from './model.js'
+import { MemoryFileStore } from './store.js'
 import type {
-  DreamReport, MemoryHit, MemoryKind, MemoryRecord,
-  MemoryScope, MemoryStats, RememberInput, ResolvedMemoryConfig,
+  DreamReport,
+  MemoryConfig,
+  MemoryHit,
+  ResolvedMemoryConfig,
 } from './types.js'
 
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    memory: MemoryService
-  }
-}
-
-/** Minimal structural view of the session events we consume. */
-interface SessionEventView {
-  type: string
-  data: {
-    content?: unknown
-    source?: { kind?: string }
-    message?: { content?: unknown }
-    name?: string
-    error?: unknown
-  }
-}
-
-/** A session plus one event, as delivered by the `session/event` firehose. */
-interface SessionFeed {
-  id: string
-  event: SessionEventView
-}
-
 const DREAM_CHECK_INTERVAL_MS = 60 * 60 * 1000 // 1h
-const DREAM_SCAN_THROTTLE_MS = 10 * 60 * 1000 // 10 min
 const DREAM_LOCK_STALE_MS = 60 * 60 * 1000 // 1h
-const DEFAULT_IMPORTANCE = 0.5
-const CONFIRMED_CONFIDENCE = 0.9
+const READ_CHARS_CAP = 8000 // ~2k tokens per disclosure
+const DAILY_EXTRACT_DAYS = 7 // dream reads the last week of daily files
+
+const CORRECTION_PATTERNS = [
+  /不要|别|别再/, /应该|应当|必须|要(?:记得|注意)/, /我说过|说过|之前说(?:过)?/,
+  /错了|不对|不是这样|搞错了/, /记住|记一下|记到记忆/, /以后|下次(?:记得)?/, /其实/,
+]
+
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g
+
+const SOFT_CONVENTION = '关于用户本人的写 user.md；关于当前项目的写 project.md；时间事件进 daily/；其余（包括拿不准的）写 memory.md。'
+
+const GUIDANCE = `记忆系统：以下是你（agent）与用户的共享记忆，按文件组织。${SOFT_CONVENTION}
+用 memory_search 查找（返回命中文件/小节/片段），觉得相关再用 memory_read 展开全文或小节；memory_catalog 查看完整目录。记忆由廉价模型在后台自动提取与整合（dream），你也可以主动触发 memory_dream。`
 
 /** Resolve the memory root from config or `$DSH_HOME/memory`. */
 function memoryRoot(config: ResolvedMemoryConfig): string {
@@ -57,329 +47,330 @@ function memoryRoot(config: ResolvedMemoryConfig): string {
   return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'memory')
 }
 
+function today(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function stripSystemReminders(text: string): string {
+  return text.replace(SYSTEM_REMINDER_RE, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** Extract readable text from a ContentBlock[] (compaction summary etc.). */
+function blocksToText(content: unknown): string {
+  if (typeof content === 'string') return stripSystemReminders(content)
+  if (!Array.isArray(content)) return ''
+  return stripSystemReminders(
+    content
+      .map(block => {
+        const b = block as { type?: string; text?: string }
+        return b.type === 'text' && typeof b.text === 'string' ? b.text : ''
+      })
+      .filter(Boolean)
+      .join('\n'),
+  )
+}
+
+interface Meta {
+  lastDreamAt: number | null
+  dreamCount: number
+}
+
 export class MemoryService extends Service {
   readonly config: ResolvedMemoryConfig
-  private records: MemoryRecord[] = []
+  private store: MemoryFileStore
   private bm25 = new Bm25Index()
-  private store: MemStore
+  private backend: ModelBackend | null
   private disposers: Array<() => void> = []
   private lastDreamAt: number | null = null
   private dreamCount = 0
-  private correctionCount = 0
-  /** Rolling buffer of high-signal session activity for the dream digest. */
-  private activityBuffer: Array<{ sessionId: string; line: string; at: number }> = []
   private sessionsSinceDream = new Set<string>()
-  private dirty = false
+  private sessionCompacted = new Set<string>()
+  private activityBuffer: Array<{ sessionId: string; line: string }> = []
 
   constructor(ctx: Context, config: ResolvedMemoryConfig) {
     super(ctx, 'memory')
     this.config = config
-    this.store = new JsonMemStore(memoryRoot(config))
-    mkdirSync(memoryRoot(config), { recursive: true })
-  }
-
-  async [Service.init](): Promise<void> {
-    this.records = await this.store.load()
+    this.store = new MemoryFileStore(memoryRoot(config))
+    this.store.ensureLayout()
+    this.store.cleanupTemp()
+    this.backend = createBackend(config)
+    const meta = this.readMeta()
+    this.lastDreamAt = meta.lastDreamAt
+    this.dreamCount = meta.dreamCount
     this.rebuildIndex()
     this.observeSessions()
-    this.observeCorrections()
     this.scheduleDream()
-    // Persist any pending state on teardown (reversible side effect).
-    this.ctx.effect(() => () => {
-      if (this.dirty) void this.persist()
-      for (const dispose of this.disposers.splice(0)) dispose()
-    }, 'agent-memory.teardown')
-    this.injectProfileSection()
+    this.injectCatalog()
   }
 
-  // ── write path ───────────────────────────────────────────────────────────
+  // ── public API ────────────────────────────────────────────────────────────
 
-  /** Write one belief. Corrections auto-apply and supersede conflicts. */
-  async remember(input: RememberInput): Promise<MemoryRecord> {
-    const content = input.content.trim()
-    if (content.length === 0) throw new TypeError('memory content must be non-empty')
-    const scope = input.scope ?? 'user'
-    const kind = input.kind ?? 'fact'
-    const now = Date.now()
+  /** Save one entry as a `## <first line>` section in the target file. */
+  save(content: string, target: string = 'memory'): { target: string; title: string } {
+    const body = content.trim()
+    const title = firstLine(body) || '记录'
+    this.store.upsertSection(target, title, body)
+    this.rebuildIndex()
+    this.injectCatalog()
+    return { target, title }
+  }
 
-    // Dedupe: identical normalized content in the same scope merges into the
-    // existing active record instead of accumulating.
-    const normalized = normalize(content)
-    const existing = this.records.find(r =>
-      r.status === 'active' && r.scope === scope && normalize(r.content) === normalized,
-    )
-    if (existing !== undefined) {
-      const updated = {
-        ...existing,
-        importance: Math.max(existing.importance, input.importance ?? DEFAULT_IMPORTANCE),
-        updatedAt: now,
-        ...input.correction === true ? { confidence: Math.max(existing.confidence, 0.95) } : {},
+  /** Save an entry into a daily file (time-anchored). */
+  saveDaily(content: string, date?: string): void {
+    const body = content.trim()
+    const title = firstLine(body) || '记录'
+    this.store.upsertSection('daily', title, body, date ?? today())
+    this.rebuildIndex()
+    this.injectCatalog()
+  }
+
+  /** BM25 search across every memory document (daily supports date range). */
+  search(query: string, opts: { target?: string; topK?: number; from?: string; to?: string } = {}): MemoryHit[] {
+    const topK = opts.topK ?? this.config.searchTopK
+    const filter = (id: string): boolean => {
+      const [target, date] = id.split('::')
+      if (opts.target !== undefined && opts.target !== 'all' && target !== opts.target) return false
+      if (target === 'daily') {
+        if (opts.from !== undefined && date < opts.from) return false
+        if (opts.to !== undefined && date > opts.to) return false
       }
-      this.replaceRecord(updated)
-      return updated
+      return true
     }
-
-    const record: MemoryRecord = {
-      id: randomUUID(),
-      content,
-      scope,
-      kind,
-      confidence: input.correction === true ? 0.95 : 0.5,
-      importance: input.importance ?? DEFAULT_IMPORTANCE,
-      status: input.correction === true ? 'active' : 'suggested',
-      source: input.source,
-      createdAt: now,
-      updatedAt: now,
-    }
-
-    // A correction supersedes conflicting active beliefs in the same scope:
-    // the old record is kept for audit but points at the new one.
-    if (input.correction === true) {
-      this.correctionCount += 1
-      for (const conflict of this.conflictsWith(record)) {
-        this.replaceRecord({ ...conflict, status: 'archived', supersededBy: record.id, updatedAt: now })
+    return this.bm25.search(query, topK, filter).map(hit => {
+      const [target, date, section] = hit.id.split('::')
+      return {
+        target: target === 'daily' ? `daily/${date}` : `${target}.md`,
+        section,
+        snippet: this.snippetFor(hit.id),
+        score: Math.round(hit.score * 100) / 100,
       }
-    }
-
-    this.records.push(record)
-    this.dirty = true
-    this.bm25.upsert(record.id, record.content)
-    this.emitChanged('set', record.id, scope)
-    await this.persist()
-    return record
-  }
-
-  /** Promote a suggestion to active and raise its confidence. */
-  async confirm(id: string): Promise<MemoryRecord> {
-    const record = this.get(id)
-    if (record === undefined) throw new Error(`memory ${id} not found`)
-    if (record.status !== 'suggested') return record
-    const updated: MemoryRecord = {
-      ...record,
-      status: 'active',
-      confidence: Math.max(record.confidence, CONFIRMED_CONFIDENCE),
-      updatedAt: Date.now(),
-    }
-    this.replaceRecord(updated)
-    this.emitChanged('confirm', id, record.scope)
-    await this.persist()
-    return updated
-  }
-
-  /** Archive a memory (never physically deleted — auditable history). */
-  async forget(id: string): Promise<boolean> {
-    const record = this.get(id)
-    if (record === undefined || record.status === 'archived') return false
-    this.replaceRecord({ ...record, status: 'archived', updatedAt: Date.now() })
-    this.emitChanged('forget', id, record.scope)
-    await this.persist()
-    return true
-  }
-
-  // ── read path ────────────────────────────────────────────────────────────
-
-  get(id: string): MemoryRecord | undefined {
-    return this.records.find(r => r.id === id)
-  }
-
-  list(opts?: { scope?: MemoryScope; kind?: MemoryKind; status?: MemoryRecord['status'] }): MemoryRecord[] {
-    return this.records.filter(r =>
-      (opts?.scope === undefined || r.scope === opts.scope)
-      && (opts?.kind === undefined || r.kind === opts.kind)
-      && (opts?.status === undefined || r.status === opts.status),
-    ).sort((a, b) => b.updatedAt - a.updatedAt)
-  }
-
-  /** Ranked recall: relevance × confidence × importance × recency. */
-  search(query: string, opts?: { scope?: MemoryScope; topK?: number }): MemoryHit[] {
-    const topK = opts?.topK ?? this.config.searchTopK
-    const hits = this.bm25.search(query, Math.max(topK, 10), id => {
-      const record = this.get(id)
-      return record !== undefined
-        && record.status === 'active'
-        && (opts?.scope === undefined || record.scope === opts.scope)
     })
-    return hits.map(({ id, score }) => {
-      const record = this.get(id)!
-      return { record, score: score * (0.5 + record.confidence) * (0.5 + record.importance) }
-    }).sort((a, b) => b.score - a.score).slice(0, topK)
   }
 
-  async recall(query: string, opts?: { scope?: MemoryScope; topK?: number }): Promise<MemoryHit[]> {
-    return this.search(query, opts)
+  /** Read a whole document or one section (token-capped). */
+  read(target: string, section?: string, date?: string): string {
+    const sections = this.store.readSections(target, date)
+    if (sections.length === 0) return target === 'daily' ? '（该日期无记忆记录）' : '（文件为空）'
+    const wanted = section !== undefined ? sections.find(s => s.title === section) : undefined
+    const text = wanted !== undefined ? `## ${wanted.title}\n\n${wanted.body}` : this.store.readText(target, date)
+    return cap(text, READ_CHARS_CAP)
   }
 
-  /** Build the "profile" snapshot (top user + project beliefs) within budget. */
-  profileSnapshot(budgetChars: number): string {
-    const scoped = this.records.filter(r => r.status === 'active' && (r.scope === 'user' || r.scope === 'project'))
-      .sort((a, b) => (b.importance * b.confidence) - (a.importance * a.confidence))
-    const lines: string[] = []
-    let used = 0
-    for (const record of scoped) {
-      const line = `- [${record.kind}:${record.scope}] ${record.content}`
-      if (used + line.length > budgetChars) break
-      lines.push(line)
-      used += line.length
-    }
-    return lines.join('\n')
+  /** The deterministic memory catalog (also injected). */
+  catalog(): string {
+    return this.store.catalog(this.config.catalogTopN, this.config.catalogBudgetTokens * 4)
   }
 
-  /** Resume narrative: what happened recently, rendered deterministically. */
-  resumeDigest(maxLines: number): string {
-    const recent = [...this.activityBuffer].sort((a, b) => b.at - a.at).slice(0, maxLines)
-    if (recent.length === 0) return ''
-    const seen = new Set<string>()
-    const lines: string[] = []
-    for (const { line } of recent) {
-      if (seen.has(line)) continue
-      seen.add(line)
-      lines.push(`- ${line}`)
+  /** Correction learning: replace the section containing `match`. */
+  correct(match: string, newContent: string): boolean {
+    const targets = ['user', 'agent', 'memory', 'project']
+    for (const target of targets) {
+      for (const section of this.store.readSections(target)) {
+        const haystack = `${section.title}\n${section.body}`
+        if (haystack.includes(match) || this.bm25Matches(section.body, match)) {
+          this.store.upsertSection(target, section.title, newContent.trim())
+          this.rebuildIndex()
+          this.injectCatalog()
+          return true
+        }
+      }
     }
-    return lines.join('\n')
+    return false
   }
 
-  stats(): MemoryStats {
-    const byScope: Record<MemoryScope, number> = { user: 0, project: 0, session: 0, global: 0 }
-    const byStatus: Record<MemoryRecord['status'], number> = { suggested: 0, active: 0, archived: 0 }
-    const byKind: Record<MemoryKind, number> = { fact: 0, preference: 0, decision: 0, lesson: 0 }
-    const activeConfidences: number[] = []
-    for (const record of this.records) {
-      byScope[record.scope] += 1
-      byStatus[record.status] += 1
-      byKind[record.kind] += 1
-      if (record.status === 'active') activeConfidences.push(record.confidence)
+  /** Run a dream consolidation pass (gated unless forced). */
+  async dream(force: boolean = false): Promise<DreamReport> {
+    const now = Date.now()
+    if (!force) {
+      if (this.lastDreamAt !== null && now - this.lastDreamAt < this.config.dreamIntervalHours * 3600 * 1000) {
+        return { ran: false, ranAt: now, reason: 'interval gate', changed: [] }
+      }
+      if (this.sessionsSinceDream.size < this.config.dreamMinSessions) {
+        return { ran: false, ranAt: now, reason: 'session gate', changed: [] }
+      }
     }
-    activeConfidences.sort((a, b) => a - b)
-    const median = activeConfidences.length === 0
-      ? 0
-      : activeConfidences[Math.floor(activeConfidences.length / 2)] ?? 0
-    return {
-      total: this.records.length,
-      byScope, byStatus, byKind,
-      suggestedPending: byStatus.suggested,
-      medianConfidence: median,
-      lastDreamAt: this.lastDreamAt,
-      dreamCount: this.dreamCount,
-      correctionCount: this.correctionCount,
+    if (this.backend === null) {
+      return { ran: false, ranAt: now, reason: 'model unavailable', changed: [] }
     }
-  }
-
-  // ── dream (consolidation) ────────────────────────────────────────────────
-
-  /** Manual trigger; the internal scheduler calls this with force=false. */
-  async dream(force = false): Promise<DreamReport> {
-    if (!force && !this.dreamGatesPass()) {
-      return { ranAt: 0, sessionsScanned: 0, candidates: 0, merged: 0, superseded: 0, archived: 0, digestProduced: false }
-    }
-    if (!this.acquireDreamLock()) {
-      return { ranAt: 0, sessionsScanned: 0, candidates: 0, merged: 0, superseded: 0, archived: 0, digestProduced: false, error: 'dream lock held by another process' }
-    }
-    const started = Date.now()
-    const report: DreamReport = {
-      ranAt: started,
-      sessionsScanned: this.sessionsSinceDream.size,
-      candidates: this.sessionsSinceDream.size,
-      merged: 0, superseded: 0, archived: 0, digestProduced: false,
+    const lockPath = join(this.store.root, 'dream.lock')
+    if (!this.acquireLock(lockPath)) {
+      return { ran: false, ranAt: now, reason: 'locked by another pass', changed: [] }
     }
     try {
-      // Orient: index of current active beliefs (self.records).
-      // Gather: the buffered high-signal activity since the last dream.
-      // Consolidate (deterministic): merge near-duplicates, archive stale.
-      const seen = new Map<string, MemoryRecord>()
-      const now = Date.now()
-      for (const record of this.records) {
-        if (record.status !== 'active') continue
-        const key = `${record.scope}:${record.kind}:${normalize(record.content)}`
-        const prior = seen.get(key)
-        if (prior !== undefined) {
-          report.merged += 1
-          this.replaceRecord({ ...prior, updatedAt: now, supersededBy: undefined })
-          this.replaceRecord({ ...record, status: 'archived', supersededBy: prior.id, updatedAt: now })
-        } else {
-          seen.set(key, record)
-        }
-        // Archive very low-confidence, untouched beliefs.
-        if (record.confidence < 0.25 && now - record.updatedAt > 30 * 24 * 3600 * 1000) {
-          report.archived += 1
-          this.replaceRecord({ ...record, status: 'archived', updatedAt: now })
+      const prompt = this.dreamPrompt()
+      const result = await completeJson(this.backend, prompt)
+      const files = result.files as Record<string, unknown> | undefined
+      const changed: string[] = []
+      const writes: Array<{ target: string; content: string }> = []
+      if (files !== undefined) {
+        for (const [target, content] of Object.entries(files)) {
+          if (typeof content !== 'string' || content.trim().length === 0) continue
+          writes.push({ target, content: content.trim() })
+          changed.push(`${target}.md`)
         }
       }
-      // Prune & index: rebuild BM25 and produce the resume digest.
-      this.rebuildIndex()
-      this.activityBuffer = this.activityBuffer.slice(-200)
-      this.sessionsSinceDream.clear()
-      this.lastDreamAt = started
+      for (const write of writes) this.applyConsolidated(write.target, write.content)
+      this.archiveOldDaily()
+      const report = typeof result.report === 'string' ? result.report : '（无报告）'
+      this.store.appendDream(report)
+      this.lastDreamAt = now
       this.dreamCount += 1
-      report.digestProduced = true
-      await this.persist()
-      return report
+      this.sessionsSinceDream.clear()
+      this.writeMeta()
+      this.rebuildIndex()
+      this.injectCatalog()
+      return { ran: true, ranAt: now, reason: 'consolidated', changed, report }
+    } catch (error) {
+      return { ran: false, ranAt: now, reason: `dream failed: ${String(error)}`, changed: [] }
     } finally {
-      this.releaseDreamLock()
+      try { unlinkSync(lockPath) } catch { /* best effort */ }
     }
   }
 
-  /** Persist the current record set (fire-and-forget safe; serialized by the store). */
-  async persist(): Promise<void> {
-    await this.store.save(this.records)
-    this.dirty = false
+  /** Light stats for diagnostics and tests. */
+  stats(): Record<string, unknown> {
+    return {
+      files: ['user', 'agent', 'memory', 'project', 'daily', 'dream'],
+      dailyDates: this.store.dailyDates().length,
+      lastDreamAt: this.lastDreamAt,
+      dreamCount: this.dreamCount,
+      backend: this.backend !== null,
+      sessionsSinceDream: this.sessionsSinceDream.size,
+    }
   }
 
-  // ── internals ────────────────────────────────────────────────────────────
+  // ── pipeline internals ─────────────────────────────────────────────────────
 
-  private replaceRecord(record: MemoryRecord): void {
-    const index = this.records.findIndex(r => r.id === record.id)
-    if (index >= 0) this.records[index] = record
-    this.dirty = true
-    this.bm25.upsert(record.id, record.content)
-  }
-
+  /** Index every section of every memory document. */
   private rebuildIndex(): void {
     this.bm25 = new Bm25Index()
-    for (const record of this.records) {
-      if (record.status === 'active') this.bm25.upsert(record.id, record.content)
+    const indexFile = (target: string, date?: string): void => {
+      for (const section of this.store.readSections(target, date)) {
+        const id = date !== undefined ? `${target}::${date}::${section.title}` : `${target}::::${section.title}`
+        this.bm25.upsert(id, `${section.title}\n${section.body}`)
+      }
     }
+    for (const target of ['user', 'agent', 'memory', 'project']) indexFile(target)
+    for (const date of this.store.dailyDates()) indexFile('daily', date)
   }
 
-  private emitChanged(op: 'set' | 'confirm' | 'forget', id: string | undefined, scope: MemoryScope): void {
-    const emit = (this.ctx as unknown as { emit: (name: string, data: unknown) => void }).emit
-    emit('memory/changed', { op, id, scope, ts: Date.now() })
+  private snippetFor(id: string): string {
+    const [target, date, section] = id.split('::')
+    const found = this.store.readSections(target, date === '' ? undefined : date)
+      .find(s => s.title === section)
+    if (found === undefined) return ''
+    const line = found.body.split('\n').find(l => l.trim().length > 0) ?? ''
+    return line.trim().slice(0, 200)
   }
 
-  /** Live capture: buffer high-signal events and detect corrections. */
+  private bm25Matches(text: string, match: string): boolean {
+    const probe = new Bm25Index()
+    probe.upsert('doc', text)
+    return probe.search(match, 1).length > 0
+  }
+
+  /** Session firehose: compaction summaries → extraction; corrections → user.md. */
   private observeSessions(): void {
     const dispose = this.ctx.on('session/event', (_session, event) => {
-      const feed = { id: String(_session.id), event: event as unknown as SessionEventView }
-      this.feed(feed)
+      const sessionId = String((_session as { id?: unknown })?.id ?? '')
+      const type = (event as { type?: string })?.type
+      if (type === 'compaction/summary') {
+        this.sessionCompacted.add(sessionId)
+        this.sessionsSinceDream.add(sessionId)
+        const summary = blocksToText((event as { data?: { summary?: unknown } }).data?.summary)
+        if (summary.length > 0) void this.extract(sessionId, summary)
+      } else if (type === 'user/message') {
+        const content = (event as { data?: { content?: unknown } }).data?.content
+        const text = blocksToText(content)
+        if (text.length > 0) {
+          this.sessionsSinceDream.add(sessionId)
+          this.activityBuffer.push({ sessionId, line: truncate(text, 120) })
+          if (this.activityBuffer.length > 200) this.activityBuffer.splice(0, 50)
+          if (this.config.autoExtract && isCorrection(text)) {
+            this.store.appendToSection('user', '偏好', stripSystemReminders(text))
+            this.rebuildIndex()
+            this.injectCatalog()
+          }
+        }
+      } else if (type === 'session/disposed') {
+        if (!this.sessionCompacted.has(sessionId) && this.config.autoExtract && this.backend !== null) {
+          const digest = this.activityBuffer
+            .filter(entry => entry.sessionId === sessionId)
+            .slice(-15)
+            .map(entry => entry.line)
+            .join('\n')
+          if (digest.length > 0) void this.extract(sessionId, digest, true)
+        }
+      }
     })
     this.disposers.push(dispose)
   }
 
-  private feed(feed: SessionFeed): void {
-    const { type, data } = feed.event
-    if (type === 'user/message') {
-      const text = stripSystemReminders(extractText(data.content))
-      if (text.length === 0) return
-      this.sessionsSinceDream.add(feed.id)
-      this.activityBuffer.push({ sessionId: feed.id, line: truncate(`用户: ${text}`, 120), at: Date.now() })
-      if (this.config.autoCapture && isCorrection(text)) {
-        void this.remember({
-          content: correctionClaim(text),
-          scope: 'user',
-          kind: 'preference',
-          correction: true,
-          source: { sessionId: feed.id, seqRange: [0, 0] },
-        }).catch(() => undefined)
-      }
-    } else if (type === 'tool/result' && data.error === undefined) {
-      const toolName = typeof data.name === 'string' ? data.name : String(data.name ?? 'tool')
-      this.activityBuffer.push({ sessionId: feed.id, line: truncate(`完成: ${toolName}`, 80), at: Date.now() })
+  /** T2 extraction: cheap model turns a summary/digest into a daily 纪要 entry. */
+  private async extract(sessionId: string, source: string, isDigest = false): Promise<void> {
+    if (this.backend === null || !this.config.autoExtract) return
+    try {
+      const kind = isDigest ? '会话片段摘要' : '官方压缩摘要'
+      const prompt = `你是记忆提取器。把下面的${kind}提炼成一份简明的中文会话纪要（要点式 5-10 行）：
+- 保留：关键决策、进展、明确表达的用户偏好、项目约定、值得长期记住的事实
+- 丢弃：寒暄、过程噪声、临时细节（会话日志已保留完整记录）
+只输出纪要正文，不要标题，不要解释。\n\n${cap(source, 4000)}`
+      const entry = (await this.backend.complete(prompt)).trim()
+      if (entry.length === 0) return
+      this.store.appendBlock('daily', '会话纪要', `- [${new Date().toISOString().slice(11, 16)}] ${entry.replace(/\n/g, '\n  ')}`)
+      this.rebuildIndex()
+      this.injectCatalog()
+    } catch {
+      // extraction is best-effort; memory read/write never depends on it
     }
   }
 
-  private observeCorrections(): void {
-    // Reserved: explicit correction feedback arrives through memory_confirm /
-    // memory_forget and the correction path in remember(). A dedicated
-    // adoption-feedback loop (does a recalled memory get used?) ships in v0.2.
+  /** Dream prompt: all thematic files + recent daily → consolidated full content. */
+  private dreamPrompt(): string {
+    const parts: string[] = ['你是记忆整合者。读取以下记忆文件，输出整合后的完整文件内容。',
+      '规则：',
+      '1. 合并重复条目，删除过时内容，交叉修正矛盾（例如 user.md 与 memory.md 对同一偏好的不同表述）',
+      '2. 保留所有仍有效的事实/决策/偏好/教训；语言精炼',
+      '3. user.md 尽量归入五个固定小节：身份与背景 / 偏好 / 目标 / 禁忌与边界 / 想法',
+      '4. 只输出 JSON：{"files": {"user": "...", "agent": "...", "memory": "...", "project": "..."}, "report": "本次整合的变更说明（合并/删除/新增，中文，3-6 行）"}',
+      '   未变更的文件省略；每个文件内容以 # 标题开头。\n']
+    for (const target of ['user', 'agent', 'memory', 'project']) {
+      const text = this.store.readText(target)
+      if (text.trim().length > 0) parts.push(`===== ${target}.md =====\n${cap(text, 3000)}`)
+    }
+    for (const date of this.store.dailyDates().slice(0, DAILY_EXTRACT_DAYS)) {
+      const text = this.store.readText('daily', date)
+      if (text.trim().length > 0) parts.push(`===== daily/${date}.md =====\n${cap(text, 2000)}`)
+    }
+    return parts.join('\n\n')
+  }
+
+  private applyConsolidated(target: string, content: string): void {
+    if (target === 'dream') return
+    if (target === 'daily') return
+    this.store.writeRaw(target, content)
+  }
+
+  private archiveOldDaily(): void {
+    const cutoff = Date.now() - this.config.dailyRetentionDays * 24 * 3600 * 1000
+    for (const date of this.store.dailyDates()) {
+      if (new Date(`${date}T00:00:00Z`).getTime() < cutoff) this.store.archiveDaily(date)
+    }
+  }
+
+  private acquireLock(lockPath: string): boolean {
+    try {
+      const stat = existsSync(lockPath) ? statSync(lockPath) : null
+      if (stat !== null) {
+        const pid = Number(readFileSync(lockPath, 'utf8').trim())
+        const stale = Date.now() - stat.mtimeMs > DREAM_LOCK_STALE_MS
+        if (!stale && pid !== process.pid) return false
+      }
+      writeFileSync(lockPath, String(process.pid), 'utf8')
+      return true
+    } catch {
+      return false
+    }
   }
 
   private scheduleDream(): void {
@@ -391,142 +382,59 @@ export class MemoryService extends Service {
     this.disposers.push(dispose)
   }
 
-  private dreamGatesPass(): boolean {
-    if (this.config.dreamIntervalHours <= 0) return false
-    const now = Date.now()
-    if (this.lastDreamAt !== null && now - this.lastDreamAt < this.config.dreamIntervalHours * 3600 * 1000) return false
-    if (this.sessionsSinceDream.size < this.config.dreamMinSessions) return false
-    return true
-  }
-
-  private acquireDreamLock(): boolean {
-    const lockPath = join(memoryRoot(this.config), 'dream.lock')
-    try {
-      const existing = readLock(lockPath)
-      if (existing !== null && now() - existing.mtime < DREAM_LOCK_STALE_MS && existing.pid !== process.pid) {
-        return false
-      }
-      writeLock(lockPath)
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  private releaseDreamLock(): void {
-    const lockPath = join(memoryRoot(this.config), 'dream.lock')
-    try {
-      const existing = readLock(lockPath)
-      if (existing?.pid === process.pid) {
-        unlinkSync(lockPath)
-      }
-    } catch {
-      // lock cleanup is best-effort
-    }
-  }
-
-  private conflictsWith(record: MemoryRecord): MemoryRecord[] {
-    return this.records.filter(r =>
-      r.status === 'active'
-      && r.scope === record.scope
-      && (r.kind === 'preference' || r.kind === 'lesson')
-      && r.id !== record.id
-      && tokenOverlap(r.content, record.content) >= 2,
-    )
-  }
-
-  private injectProfileSection(): void {
-    const systemPrompt = this.ctx.get('systemPrompt') as { section?: (opts: { name: string; order: number; text: string }) => void } | undefined
+  /** Standing injection: guidance + deterministic catalog + today's points. */
+  private injectCatalog(): void {
+    const systemPrompt = this.ctx.get('systemPrompt') as
+      | { section?: (opts: { name: string; order: number; text: string }) => void }
+      | undefined
     if (systemPrompt?.section === undefined) return
-    const profile = this.profileSnapshot(this.config.snapshotBudgetChars)
-    const digest = this.resumeDigest(5)
-    const parts = [
-      profile.length > 0 ? `Known preferences and project conventions — apply these:\n${profile}` : '',
-      digest.length > 0 ? `Recent work — continue from here:\n${digest}` : '',
-    ].filter(Boolean)
-    if (parts.length === 0) return
-    systemPrompt.section({
-      name: 'memory:profile',
-      order: -50,
-      text: parts.join('\n\n'),
-    })
+    const budget = this.config.catalogBudgetTokens * 4
+    const todayPoints = this.store.todayPoints(Math.floor(budget * 0.15))
+    const catalog = this.store.catalog(this.config.catalogTopN, Math.floor(budget * 0.85))
+    const text = `${GUIDANCE}\n\n${catalog}${todayPoints.length > 0 ? `\n${todayPoints}` : ''}`
+    systemPrompt.section({ name: 'memory', order: 116, text })
+  }
+
+  // ── meta persistence ───────────────────────────────────────────────────────
+
+  private metaPath(): string {
+    return join(this.store.root, '.meta.json')
+  }
+
+  private readMeta(): Meta {
+    try {
+      const raw = JSON.parse(readFileSync(this.metaPath(), 'utf8')) as Partial<Meta>
+      return {
+        lastDreamAt: typeof raw.lastDreamAt === 'number' ? raw.lastDreamAt : null,
+        dreamCount: typeof raw.dreamCount === 'number' ? raw.dreamCount : 0,
+      }
+    } catch {
+      return { lastDreamAt: null, dreamCount: 0 }
+    }
+  }
+
+  private writeMeta(): void {
+    try {
+      writeFileSync(this.metaPath(), JSON.stringify({ lastDreamAt: this.lastDreamAt, dreamCount: this.dreamCount }, null, 2))
+    } catch {
+      // meta is best-effort bookkeeping
+    }
   }
 }
 
-const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g
-
-/** Strip `<system-reminder>` blocks that DSH injects into user-message content. */
-function stripSystemReminders(text: string): string {
-  return text.replace(SYSTEM_REMINDER_RE, ' ').replace(/\s+/g, ' ').trim()
-}
-
-function extractText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content.map(block => {
-      const b = block as { type?: string; text?: string }
-      return typeof b.text === 'string' ? b.text : ''
-    }).join(' ')
-  }
-  return ''
-}
-
-const CORRECTION_PATTERNS = [
-  /不要|别|别再/, /应该|应当|必须|要(?:记得|注意)/, /我说过|说过|之前说(?:过)?/,
-  /错了|不对|不是这样|搞错了/, /记住|记一下|记到记忆/, /以后|下次(?:记得)?/, /其实/,
-]
-
-function isCorrection(text: string): boolean {
-  return CORRECTION_PATTERNS.some(pattern => pattern.test(text))
-}
-
-/** Extract a compact claim from a correction message (best-effort, deterministic). */
-function correctionClaim(text: string): string {
-  const trimmed = text.replace(/\s+/g, ' ').trim()
-  return truncate(trimmed, 160)
-}
-
-function normalize(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, ' ').trim()
-}
-
-function tokenOverlap(a: string, b: string): number {
-  const setA = new Set(tokenizeForOverlap(a))
-  let overlap = 0
-  for (const token of tokenizeForOverlap(b)) {
-    if (setA.has(token)) overlap += 1
-  }
-  return overlap
-}
-
-function tokenizeForOverlap(text: string): string[] {
-  const words: string[] = text.toLowerCase().match(/[a-z0-9_]+/g) ?? []
-  const cjk: string[] = [...text].filter(ch => ch.codePointAt(0)! >= 0x4e00)
-  return [...new Set([...words, ...cjk])]
+function firstLine(text: string): string {
+  const line = text.split('\n').find(l => l.trim().length > 0)
+  return line === undefined ? '' : line.trim().slice(0, 40)
 }
 
 function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+  return text.length <= max ? text : `${text.slice(0, max)}…`
 }
 
-// Lock file helpers — minimal, crash-recoverable (stale after 1h).
-interface LockState { pid: number; mtime: number }
-
-function readLock(path: string): LockState | null {
-  try {
-    const raw = readFileSync(path, 'utf8')
-    const parsed = JSON.parse(raw) as { pid?: number; mtime?: number }
-    if (typeof parsed.pid !== 'number' || typeof parsed.mtime !== 'number') return null
-    return { pid: parsed.pid, mtime: parsed.mtime }
-  } catch {
-    return null
-  }
+function cap(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…（截断）`
 }
 
-function writeLock(path: string): void {
-  writeFileSync(path, JSON.stringify({ pid: process.pid, mtime: Date.now() }), 'utf8')
-}
-
-function now(): number {
-  return Date.now()
+function isCorrection(text: string): boolean {
+  return CORRECTION_PATTERNS.some(pattern => pattern.test(text))
 }

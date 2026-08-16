@@ -1,10 +1,13 @@
 /**
- * `dsh-evolving-memory` — self-evolving memory for DeepSeek Harness.
+ * `dsh-evolving-memory` — file-based self-evolving memory for DeepSeek
+ * Harness (v2).
  *
- * Mounts the `ctx.memory` service (capture → dream consolidation → retrieval
- * injection → evolve) and seven model tools. Everything is registered through
- * the fiber, so unmount or hot reload leaves no listeners, timers, or state
- * behind.
+ * Memory is compression and extraction: the plugin consumes official
+ * compaction summaries (T1), extracts into the daily time layer (T2), and
+ * dream-consolidates episodic → semantic (T3). Five Markdown documents
+ * (user/agent/memory/dream + per-project) with a soft classification
+ * convention, bounded catalog injection (skill pattern), and six model
+ * tools. Everything is registered through the fiber.
  * @module
  */
 
@@ -19,26 +22,32 @@ export const inject = ['tools']
 
 export const Config: z<MemoryConfig> = z.object({
   memoryDir: z.string().default(''),
-  profileBudgetTokens: z.number().min(100).default(2000),
   dreamIntervalHours: z.number().min(0).default(24),
   dreamMinSessions: z.number().min(1).default(5),
-  dreamUseCheapModel: z.boolean().default(true),
+  model: z.string().default('deepseek-chat'),
+  apiKey: z.string().default(''),
+  baseURL: z.string().default('https://api.deepseek.com'),
+  catalogBudgetTokens: z.number().min(200).default(1000),
+  catalogTopN: z.number().min(1).max(20).default(5),
   searchTopK: z.number().min(1).max(50).default(5),
-  autoCapture: z.boolean().default(true),
-  snapshotBudgetChars: z.number().min(200).default(1200),
+  autoExtract: z.boolean().default(true),
+  dailyRetentionDays: z.number().min(1).default(30),
 })
 
 /** Resolve config with the same defaults the schemastery schema applies. */
-function resolveConfig(config: MemoryConfig): ResolvedMemoryConfig {
+export function resolveConfig(config: MemoryConfig): ResolvedMemoryConfig {
   return {
     memoryDir: config.memoryDir ?? '',
-    profileBudgetTokens: config.profileBudgetTokens ?? 2000,
     dreamIntervalHours: config.dreamIntervalHours ?? 24,
     dreamMinSessions: config.dreamMinSessions ?? 5,
-    dreamUseCheapModel: config.dreamUseCheapModel ?? true,
+    model: config.model ?? 'deepseek-chat',
+    apiKey: config.apiKey ?? '',
+    baseURL: config.baseURL ?? 'https://api.deepseek.com',
+    catalogBudgetTokens: config.catalogBudgetTokens ?? 1000,
+    catalogTopN: config.catalogTopN ?? 5,
     searchTopK: config.searchTopK ?? 5,
-    autoCapture: config.autoCapture ?? true,
-    snapshotBudgetChars: config.snapshotBudgetChars ?? 1200,
+    autoExtract: config.autoExtract ?? true,
+    dailyRetentionDays: config.dailyRetentionDays ?? 30,
   }
 }
 

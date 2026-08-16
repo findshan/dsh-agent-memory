@@ -1,25 +1,28 @@
 /**
- * Smoke test: mounts the real plugin in a bare Cordis root context with
- * stubbed `tools` / `systemPrompt` services, then exercises the memory
- * lifecycle: remember → confirm → recall → correction supersede → persistence
- * → dream. Run against the built `dist` output: `node test/smoke.mjs`.
+ * Smoke test: mounts the v2 plugin in a bare Cordis root context with
+ * stubbed `tools` / `systemPrompt` services and no model (apiKey empty →
+ * dream/extraction gracefully skip), then exercises the file-based memory
+ * lifecycle: layout → save → read → search → catalog → correct → correction
+ * capture (with system-reminder hygiene) → daily layer → dream gate →
+ * persistence → remount stability. Run against built `dist`: `node test/smoke.mjs`.
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as plugin from '../dist/index.js'
 
 const toolsStub = { register: () => () => {} }
-const systemPromptStub = { section: () => {}, context: () => {} }
+const sections = []
+const systemPromptStub = { section: opts => { sections.push(opts); return () => {} } }
 
-async function mount(dir) {
+async function mount(dir, overrides = {}) {
   const ctx = new Context()
   ctx.provide('tools', toolsStub)
   ctx.provide('systemPrompt', systemPromptStub)
-  const fiber = ctx.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, autoCapture: false })
+  const fiber = ctx.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, apiKey: '', ...overrides })
   await fiber
   const memory = ctx.get('memory')
   assert.ok(memory !== undefined, 'ctx.memory must be registered')
@@ -30,116 +33,115 @@ async function unmount(fiber) {
   await fiber.dispose()
 }
 
-async function main() {
-  const dir = mkdtempSync(join(tmpdir(), 'agent-memory-test-'))
+const flush = () => new Promise(resolve => setTimeout(resolve, 80))
 
-  // ── mount with tool capture: all 7 tools registered ─────────────────────
+async function main() {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-memory-v2-test-'))
+
+  // ── tool registration: all 6 tools ───────────────────────────────────────
   const registeredTools = []
   const captureTools = { register: def => { registeredTools.push(def.name); return () => {} } }
   const ctx0 = new Context()
   ctx0.provide('tools', captureTools)
   ctx0.provide('systemPrompt', systemPromptStub)
-  const fiber0 = ctx0.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, autoCapture: false })
+  const fiber0 = ctx0.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, apiKey: '' })
   await fiber0
   assert.deepEqual(registeredTools.sort(), [
-    'memory_confirm', 'memory_forget', 'memory_list', 'memory_profile',
-    'memory_save', 'memory_search', 'memory_dream',
-  ].sort(), 'all 7 tools registered')
+    'memory_catalog', 'memory_correct', 'memory_dream',
+    'memory_read', 'memory_save', 'memory_search',
+  ].sort(), 'all 6 tools registered')
   await unmount(fiber0)
 
-  // ── core lifecycle ──────────────────────────────────────────────────────
-  let { fiber, memory } = await mount(dir)
-
-  // remember lands as suggested
-  const pref = await memory.remember({
-    content: '用户偏好使用 pnpm 而不是 npm',
-    scope: 'user', kind: 'preference',
-  })
-  assert.equal(pref.status, 'suggested', 'write lands suggested')
-
-  // confirm promotes and raises confidence
-  const confirmed = await memory.confirm(pref.id)
-  assert.equal(confirmed.status, 'active')
-  assert.ok(confirmed.confidence >= 0.9, 'confirm raises confidence')
-
-  // recall finds it
-  const hits = await memory.search('pnpm')
-  assert.ok(hits.some(h => h.record.id === pref.id), 'recall finds confirmed memory')
-
-  // correction supersedes the old belief (old kept, points at new)
-  const correction = await memory.remember({
-    content: '用户改用 npm 了，不再用 pnpm',
-    scope: 'user', kind: 'preference', correction: true,
-  })
-  assert.equal(correction.status, 'active', 'correction auto-applies')
-  const old = await memory.get(pref.id)
-  assert.equal(old.status, 'archived', 'superseded belief archived')
-  assert.equal(old.supersededBy, correction.id, 'old belief points at replacement')
-  const stats = memory.stats()
-  assert.ok(stats.correctionCount >= 1, 'correction counted')
-
-  // dream (forced) consolidates and reports
-  const report = await memory.dream(true)
-  assert.ok(report.ranAt > 0, 'dream ran')
-  assert.ok(report.digestProduced, 'digest produced')
-  const afterDream = memory.stats()
-  assert.ok(afterDream.dreamCount >= 1, 'dream counted')
-
-  // profile snapshot is non-empty and bounded
-  const profile = memory.profileSnapshot(500)
-  assert.ok(profile.length > 0 && profile.length <= 500, 'profile snapshot bounded')
-
-  // ── persistence across restart ──────────────────────────────────────────
-  await unmount(fiber)
-  const second = await mount(dir)
-  const reloaded = await second.memory.list({ scope: 'user' })
-  assert.ok(reloaded.some(r => r.content.includes('npm')), 'memories survive restart')
-  await unmount(second.fiber)
-
-  // ── capture hygiene: injected system-reminder noise never becomes memory ─
-  {
-    const ctx = new Context()
-    ctx.provide('tools', toolsStub)
-    ctx.provide('systemPrompt', systemPromptStub)
-    const fiber = ctx.plugin(plugin, { memoryDir: dir, dreamIntervalHours: 0, autoCapture: true })
-    await fiber
-    const memory = ctx.get('memory')
-
-    // DSH injects the skill catalog as a <system-reminder> block inside the
-    // user-message content; the catalog text contains phrases like
-    // "不要用 ffmpeg" that the correction patterns would otherwise match.
-    const reminderText = [
-      '<system-reminder>',
-      'A skill is a reusable set of task-specific instructions.',
-      '`lark-minutes`: 本地音视频转纪要优先走本 skill，不要用 ffmpeg/whisper 本地转写。',
-      '</system-reminder>',
-      '以后记得我用 yarn 而不是 npm',
-    ].join('\n')
-    ctx.emit('session/event', { id: 'session-capture-test' }, {
-      type: 'user/message',
-      data: { content: [{ type: 'text', text: reminderText }] },
-    })
-    await new Promise(resolve => setTimeout(resolve, 100))
-    const recs = await memory.list({ scope: 'user' })
-    const noise = recs.filter(r => r.content.includes('system-reminder') || r.content.includes('ffmpeg'))
-    assert.equal(noise.length, 0, 'system-reminder text must never be captured')
-    assert.ok(recs.some(r => r.content.includes('yarn')), 'real user correction after reminder is still captured')
-    await fiber.dispose()
+  // ── layout: user template + daily dir seeded on first mount ──────────────
+  assert.ok(existsSync(join(dir, 'user.md')), 'user.md seeded')
+  assert.ok(existsSync(join(dir, 'daily')), 'daily dir created')
+  const userText = readFileSync(join(dir, 'user.md'), 'utf8')
+  for (const section of ['身份与背景', '偏好', '目标', '禁忌与边界', '想法']) {
+    assert.ok(userText.includes(`## ${section}`), `user.md has ${section} section`)
   }
 
-  // ── repeated mount/unmount stability (hot reload hygiene) ───────────────
+  let { ctx, fiber, memory } = await mount(dir)
+
+  // ── save / read ──────────────────────────────────────────────────────────
+  memory.save('用户偏好使用 pnpm 而不是 npm', 'user')
+  await flush()
+  const readUser = memory.read('user')
+  assert.ok(readUser.includes('用户偏好使用 pnpm'), 'save → read user')
+  assert.ok(readUser.includes('# 用户画像'), 'user header preserved')
+
+  memory.save('决策：v2 用 Markdown 文件存储记忆', 'memory')
+  await flush()
+  assert.ok(memory.read('memory').includes('Markdown 文件存储'), 'save → memory.md')
+
+  // ── search ───────────────────────────────────────────────────────────────
+  const hits = memory.search('pnpm')
+  assert.ok(hits.some(h => h.target === 'user.md' && h.section.includes('用户偏好')), 'search finds user entry')
+  assert.ok(hits.every(h => h.score > 0), 'hits carry scores')
+
+  // ── catalog: deterministic and bounded ───────────────────────────────────
+  const catalog = memory.catalog()
+  assert.ok(catalog.includes('user.md'), 'catalog lists user.md')
+  assert.ok(catalog.includes('memory.md'), 'catalog lists memory.md')
+  assert.ok(catalog.length < 2000, 'catalog stays small')
+
+  // ── injection: systemPrompt.section mounted with catalog ────────────────
+  const injected = sections.find(s => s.name === 'memory')
+  assert.ok(injected !== undefined, 'memory section injected')
+  assert.ok(injected.order === 116, 'injection order 116')
+  assert.ok(injected.text.includes('memory_search'), 'guidance mentions tools')
+
+  // ── correction learning (file semantics) ─────────────────────────────────
+  memory.correct('pnpm', '用户现在改用 npm 而不是 pnpm')
+  await flush()
+  assert.ok(memory.read('user').includes('npm 而不是 pnpm'), 'correct replaces the entry')
+
+  // ── correction capture from session events + system-reminder hygiene ─────
+  const reminderText = [
+    '<system-reminder>',
+    'A skill is a reusable set of task-specific instructions.',
+    '`lark-minutes`: 本地音视频转纪要优先走本 skill，不要用 ffmpeg/whisper 本地转写。',
+    '</system-reminder>',
+    '以后记得我用 yarn 而不是 npm',
+  ].join('\n')
+  ctx.emit('session/event', { id: 'session-capture' }, { type: 'user/message', data: { content: [{ type: 'text', text: reminderText }] } })
+  await flush()
+  const userAfter = memory.read('user')
+  assert.ok(!userAfter.includes('ffmpeg') && !userAfter.includes('system-reminder'), 'system-reminder never captured')
+  assert.ok(userAfter.includes('yarn'), 'real correction captured into user 偏好')
+
+  // ── daily layer ──────────────────────────────────────────────────────────
+  memory.saveDaily('今日进展：记忆系统 v2 完成实现', '2099-01-01')
+  await flush()
+  assert.ok(memory.read('daily', undefined, '2099-01-01').includes('v2 完成实现'), 'daily entry readable by date')
+  const byDate = memory.search('v2 完成实现', { target: 'daily', from: '2099-01-01', to: '2099-01-31' })
+  assert.ok(byDate.length > 0, 'daily search with date range')
+  const outside = memory.search('v2 完成实现', { target: 'daily', from: '2098-01-01', to: '2098-12-31' })
+  assert.equal(outside.length, 0, 'daily date range excludes other dates')
+
+  // ── dream without a model: gated, graceful ───────────────────────────────
+  const dream = await memory.dream(true)
+  assert.equal(dream.ran, false, 'dream skips without model')
+  assert.equal(dream.reason, 'model unavailable')
+
+  // ── persistence across restart ───────────────────────────────────────────
+  await unmount(fiber)
+  const second = await mount(dir)
+  assert.ok(second.memory.read('user').includes('yarn'), 'memories survive restart')
+  assert.ok(second.memory.read('daily', undefined, '2099-01-01').length > 0, 'daily survives restart')
+  await unmount(second.fiber)
+
+  // ── repeated mount/unmount stability ─────────────────────────────────────
   for (let i = 0; i < 10; i += 1) {
     const cycle = await mount(dir)
-    const saved = await cycle.memory.remember({ content: `cycle-${i}`, scope: 'global', kind: 'fact' })
-    assert.equal(saved.status, 'suggested')
+    cycle.memory.save(`cycle-${i} 记录`, 'memory')
+    await flush()
     await unmount(cycle.fiber)
   }
   const final = await mount(dir)
-  const afterCycles = final.memory.stats()
-  assert.ok(afterCycles.total >= 3, 'no memory leak across remounts')
+  assert.ok(final.memory.read('memory').includes('cycle-9'), 'no data loss across remounts')
   await unmount(final.fiber)
 
-  console.log('ALL SMOKE TESTS PASSED')
+  console.log('ALL V2 SMOKE TESTS PASSED')
 }
 
 main().catch(error => {
