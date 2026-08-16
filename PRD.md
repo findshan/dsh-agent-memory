@@ -41,10 +41,10 @@ $DSH_HOME/memory/
 | 文件 | 内容 | 可编辑者 | 注入策略 |
 |---|---|---|---|
 | `daily/<date>.md` | 当日纪要（时间锚定） | 系统追加 + 用户可改 | 仅"今日要点"注入（续接叙事） |
-| `user.md` | 用户画像 | **用户 + agent** | 常驻注入 |
-| `agent.md` | 自我认知、工作方式、教训 | agent（用户可改） | 常驻注入 |
-| `project.md` | 项目上下文、决策、进度 | agent + 用户 | 常驻注入（当前项目） |
-| `memory.md` | 长期知识（兜底） | agent | 按需 BM25 检索 |
+| `user.md` | 用户画像 | **用户 + agent** | 目录披露（首行要点常驻，全文按需 read） |
+| `agent.md` | 自我认知、工作方式、教训 | agent（用户可改） | 目录披露 |
+| `project.md` | 项目上下文、决策、进度 | agent + 用户 | 目录披露（当前项目） |
+| `memory.md` | 长期知识（兜底） | agent | 目录披露 + 按需 search |
 | `dream.md` | 整合日志 | 系统只写 | 不注入，工具可查 |
 
 **一句话软约定**（写进提取/整合的 prompt，不写成代码逻辑）：
@@ -62,7 +62,7 @@ $DSH_HOME/memory/
 
 **两级记忆对应认知科学**：`daily/` 是**情景记忆（episodic，海马体）**——发生了什么；主题文档是**语义记忆（semantic，皮层）**——什么是真的；dream 整合就是**睡眠时情景→语义的固化**。
 
-**覆盖一切场景是构造保证，不是枚举**：任何信息 → 落进某份文档（软约定）→ 检索可达（BM25 + 日期）+ 注入可见（user/agent/project 常驻 + daily 今日要点续接）。临时上下文不存，会话日志（ground truth）兜底。
+**覆盖一切场景是构造保证，不是枚举**：任何信息 → 落进某份文档（软约定）→ 检索可达（BM25 + 日期）+ 目录可见（每文件首行要点常驻）+ 全文可披露（search/read）。记忆无限增长，常驻注入始终有界。临时上下文不存，会话日志（ground truth）兜底。
 
 **格式约定**：每个文件是 Markdown；文件保持小（KB 级），dream 负责修剪与归档（`memory-archive/` / `daily-archive/`）。
 
@@ -107,25 +107,27 @@ daily/ 今日要点 注入（开场续接叙事）；memory.md 按需 BM25 检�
 - 动作：直接更新 `user.md` 对应条目——定位旧内容并替换为新信念。**无状态机、无 supersede 链**：旧版本由 git（记忆仓库）或 dream 日志保留。
 - 冗余纠正：dream 整合时合并。
 
-### 4.4 注入与检索
+### 4.4 注入与检索：目录式披露（skill 模式）
 
-- **常驻注入**：`user.md` + `agent.md` + 当前 `project.md` 拼接为冻结快照，≤ `injectionBudgetTokens`（默认 2000），作为 system prompt 的 section（order 116，复用 v1 的注入点）。文件更新后快照才刷新。
-- **续接叙事注入**：今天（及昨天）daily 文件的 `## 今日要点` 小节注入（小预算）——新会话开场即知"进行到哪"（v1 信任三件套之一）。
-- **按需检索**：`memory_search` 用 BM25（保留 v1 的 `Bm25Index`）检索 `memory.md` 条目，Top-K 注入；也支持**日期范围**检索 `daily/`（时间查询："上周讨论过什么"）。
+记忆文件会持续增长，因此**常驻注入只放目录（catalog），内容一律按需披露**——与 DSH skill 机制同构：系统提示里只有 skill 目录（一行一个），模型用 skill 工具按需加载全文。
+
+- **常驻注入（有界）**：`memory catalog` section（order 116）——每份文件一行：`名字 / 小节数 / 最近更新 / 前 N 小节首行`；`daily/` 列出最近有记录的日期。预算 `catalogBudgetTokens`（默认 1000），记忆再多也不超。目录**确定性生成**（读文件首行 + 日期，零模型调用），任何写入/整合后刷新。
+- **续接叙事注入**：今天（及昨天）daily 的 `## 今日要点` 小节（小预算）——新会话开场即知"进行到哪"。
+- **按需披露**：`memory_search` 跨文件 BM25 检索 → 返回命中（文件/小节/片段）；模型觉得相关再 `memory_read` 加载全文或指定小节——**search 是"找"，read 是"展开"**，配套使用（同 skill 的目录→加载）。
 - **dream.md 不注入**：是日志不是知识，模型经 `memory_read('dream')` 主动查看。
 
 ## 5. 工具集（7 → 6）
 
 | 工具 | 签名 | 作用 |
 |---|---|---|
-| `memory_search` | `query, target?, topK?, from?, to?` | BM25 检索记忆文件（含 daily 日期范围），返回 Top-K 条目 |
-| `memory_read` | `target`（user/agent/project/memory/dream/daily）`date?` | 读指定记忆文件（daily 按日期） |
-| `memory_save` | `content, target?` | 追加/更新一条记忆（模型提取，target 决定文件） |
+| `memory_search` | `query, target?, topK?, from?, to?` | BM25 跨文件检索（含 daily 日期范围），返回命中条目（文件/小节/片段）——**找** |
+| `memory_read` | `target`（user/agent/project/memory/dream/daily）, `section?`, `date?` | 加载全文或指定小节（token 上限内，超限分页）——**展开** |
+| `memory_catalog` | — | 查看/刷新完整记忆目录（含全部 daily 日期） |
+| `memory_save` | `content, target?` | 追加/更新一条记忆（模型判断，target 决定文件） |
 | `memory_correct` | `new_content, match` | 纠错即学：定位旧条目并替换 |
-| `memory_profile` | — | 展示 user.md（画像可见） |
 | `memory_dream` | `force?` | 手动触发整合，返回 dream 报告 |
 
-工具面大幅简化：无 confirm（无状态机）、无 forget（用户直接编辑/git 管理）、无 list（read 即列表）。
+**披露对**：`memory_search`（找）→ 命中片段 → `memory_read`（展开全文/小节）——同 skill 的"目录→加载"。画像可见由常驻目录承载（user.md 首行要点永远在上下文里），无需专门 profile 工具。
 
 ## 6. 配置
 
@@ -135,7 +137,8 @@ daily/ 今日要点 注入（开场续接叙事）；memory.md 按需 BM25 检�
 | `dreamIntervalHours` | `24` | 梦境整合最小间隔 |
 | `dreamMinSessions` | `5` | 触发整合所需新会话数 |
 | `dreamUseCheapModel` | `true` | 提取/整合用便宜模型 |
-| `injectionBudgetTokens` | `2000` | 常驻注入预算（user+agent+project） |
+| `catalogBudgetTokens` | `1000` | 记忆目录注入预算（有界，无论记忆多大） |
+| `catalogTopN` | `5` | 目录中每文件展示前 N 小节首行 |
 | `searchTopK` | `5` | 默认检索条数 |
 | `autoExtract` | `true` | 消费 compact summary 自动提取 |
 | `dailyRetentionDays` | `30` | daily 文件保留天数，超过归档到 `daily-archive/` |
@@ -153,14 +156,14 @@ daily/ 今日要点 注入（开场续接叙事）；memory.md 按需 BM25 检�
 |---|---|
 | `compaction`（T1 压缩） | 订阅 `compaction/summary` 事件，消费其产物做提取（三级压缩的第一层） |
 | 可回放会话日志 | ground truth：提取输入的可追溯来源（保留 v1 的结构性优势） |
-| `systemPrompt.section` | 常驻注入点（order 116，冻结快照） |
+| `systemPrompt.section` | 记忆目录注入点（order 116，有界：目录 ≤ `catalogBudgetTokens` + 今日要点） |
 | AGENTS.md 约定 | 记忆文件是"动态 AGENTS.md"：user.md/agent.md/project.md 是随使用演化的版本 |
 
 ## 9. 路线图
 
 | 版本 | 内容 |
 |---|---|
-| v2.0（本次） | 5 类文件 + 每日层（daily/）+ 提取管线（compact 驱动）+ 梦境整合（情景→语义）+ 注入/检索（含续接叙事）+ 6 工具 + 纠错即学（文件语义） |
+| v2.0（本次） | 5 类文件 + 每日层（daily/）+ 提取管线（compact 驱动）+ 梦境整合（情景→语义）+ **目录式披露注入（skill 模式）** + 6 工具（search/read/catalog/save/correct/dream）+ 纠错即学（文件语义） |
 | v2.1 | git 记忆仓库自动 commit、多 agent 共享（agent.md 按 agent 分片）、Web UI 记忆面板（user.md 可视化编辑） |
 | v2.2 | 向量检索可选后端、项目记忆自动发现、记忆→skill 晋升（高复用条目生成 skill/AGENTS.md） |
 
