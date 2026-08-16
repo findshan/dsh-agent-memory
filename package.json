@@ -1,6 +1,6 @@
 {
   "name": "dsh-evolving-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "File-based self-evolving memory for DeepSeek Harness v2: compression & extraction over official compaction, daily episodic layer, dream consolidation to semantic files (user/agent/memory/dream + project), catalog disclosure injection, no confidence machine. 文件化自进化记忆：消费官方 compact 压缩提取，每日情景层 + 梦境整合固化语义，目录式披露注入，无置信度体系。",
   "license": "MIT",
   "type": "module",

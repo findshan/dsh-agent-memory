@@ -34,7 +34,8 @@ export function buildDreamPrompt(files: Array<{ label: string; text: string }>):
     '2. 保留所有仍有效的事实/决策/偏好/教训；语言精炼',
     '3. user.md 尽量归入五个固定小节：身份与背景 / 偏好 / 目标 / 禁忌与边界 / 想法',
     '4. 只输出 JSON：{"files": {"user": "...", "agent": "...", "memory": "...", "project": "..."}, "report": "本次整合的变更说明（合并/删除/新增，中文，3-6 行）"}',
-    '   未变更的文件省略；每个文件内容以 # 标题开头。\n']
+    '   未变更的文件省略；每个文件内容以 # 标题开头。',
+    '5. 重要：如果 daily 中同一用户偏好反复出现（例如包管理器、工作风格），必须将其晋升写入 user.md 的「偏好」小节——即使它最初只是被"要求保存"的任务表述。\n']
   for (const file of files) {
     if (file.text.trim().length > 0) {
       const capChars = file.label.startsWith('daily/') ? 8000 : 3000
