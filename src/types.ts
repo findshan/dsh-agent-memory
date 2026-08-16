@@ -62,6 +62,16 @@ export interface MemoryHit {
   score: number
 }
 
+/** Token usage + estimated cost of one model-backed operation. */
+export interface UsageReport {
+  calls: number
+  promptTokens: number
+  completionTokens: number
+  cacheHitTokens: number
+  cacheMissTokens: number
+  costUsd: number
+}
+
 /** Dream run report. */
 export interface DreamReport {
   ran: boolean
@@ -69,4 +79,5 @@ export interface DreamReport {
   reason: string
   changed: string[]
   report?: string
+  usage?: UsageReport
 }

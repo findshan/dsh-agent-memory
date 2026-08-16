@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Bm25Index } from './bm25.js'
 import { completeJson, createBackend, type ModelBackend } from './model.js'
+import { GUIDANCE, buildDreamPrompt, buildExtractionPrompt, cap } from './prompts.js'
 import { MemoryFileStore } from './store.js'
 import type {
   DreamReport,
@@ -35,12 +36,6 @@ const CORRECTION_PATTERNS = [
 ]
 
 const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g
-
-const SOFT_CONVENTION = '关于用户本人的写 user.md；关于当前项目的写 project.md；时间事件进 daily/；其余（包括拿不准的）写 memory.md。'
-
-const GUIDANCE = `记忆系统：以下是你（agent）与用户的共享记忆，按文件组织。${SOFT_CONVENTION}
-记忆工具只有 6 个：memory_search / memory_read / memory_catalog / memory_save / memory_correct / memory_dream。旧版工具名（memory_profile / memory_list / memory_confirm / memory_forget）已废弃，调用会报错，不要使用。
-用 memory_search 查找（返回命中文件/小节/片段），觉得相关再用 memory_read 展开全文或小节；memory_catalog 查看完整目录。记忆由廉价模型在后台自动提取与整合（dream），你也可以主动触发 memory_dream。`
 
 /** Resolve the memory root from config or `$DSH_HOME/memory`. */
 function memoryRoot(config: ResolvedMemoryConfig): string {
@@ -217,9 +212,22 @@ export class MemoryService extends Service {
       this.sessionsSinceDream.clear()
       this.writeMeta()
       this.rebuildIndex()
-        return { ran: true, ranAt: now, reason: 'consolidated', changed, report }
+      return {
+        ran: true,
+        ranAt: now,
+        reason: 'consolidated',
+        changed,
+        report,
+        usage: this.backend.usage(),
+      }
     } catch (error) {
-      return { ran: false, ranAt: now, reason: `dream failed: ${String(error)}`, changed: [] }
+      return {
+        ran: false,
+        ranAt: now,
+        reason: `dream failed: ${String(error)}`,
+        changed: [],
+        usage: this.backend === null ? undefined : this.backend.usage(),
+      }
     } finally {
       try { unlinkSync(lockPath) } catch { /* best effort */ }
     }
@@ -234,6 +242,7 @@ export class MemoryService extends Service {
       dreamCount: this.dreamCount,
       backend: this.backend !== null,
       sessionsSinceDream: this.sessionsSinceDream.size,
+      ...this.backend === null ? {} : { usage: this.backend.usage() },
     }
   }
 
@@ -307,38 +316,28 @@ export class MemoryService extends Service {
   private async extract(sessionId: string, source: string, isDigest = false): Promise<void> {
     if (this.backend === null || !this.config.autoExtract) return
     try {
-      const kind = isDigest ? '会话片段摘要' : '官方压缩摘要'
-      const prompt = `你是记忆提取器。把下面的${kind}提炼成一份简明的中文会话纪要（要点式 5-10 行）：
-- 保留：关键决策、进展、明确表达的用户偏好、项目约定、值得长期记住的事实
-- 丢弃：寒暄、过程噪声、临时细节（会话日志已保留完整记录）
-只输出纪要正文，不要标题，不要解释。\n\n${cap(source, 4000)}`
+      const prompt = buildExtractionPrompt(isDigest ? 'digest' : 'compaction', source)
       const entry = (await this.backend.complete(prompt)).trim()
       if (entry.length === 0) return
       this.store.appendBlock('daily', '会话纪要', `- [${new Date().toISOString().slice(11, 16)}] ${entry.replace(/\n/g, '\n  ')}`)
       this.rebuildIndex()
-      } catch {
+    } catch {
       // extraction is best-effort; memory read/write never depends on it
     }
   }
 
   /** Dream prompt: all thematic files + recent daily → consolidated full content. */
   private dreamPrompt(): string {
-    const parts: string[] = ['你是记忆整合者。读取以下记忆文件，输出整合后的完整文件内容。',
-      '规则：',
-      '1. 合并重复条目，删除过时内容，交叉修正矛盾（例如 user.md 与 memory.md 对同一偏好的不同表述）',
-      '2. 保留所有仍有效的事实/决策/偏好/教训；语言精炼',
-      '3. user.md 尽量归入五个固定小节：身份与背景 / 偏好 / 目标 / 禁忌与边界 / 想法',
-      '4. 只输出 JSON：{"files": {"user": "...", "agent": "...", "memory": "...", "project": "..."}, "report": "本次整合的变更说明（合并/删除/新增，中文，3-6 行）"}',
-      '   未变更的文件省略；每个文件内容以 # 标题开头。\n']
+    const files: Array<{ label: string; text: string }> = []
     for (const target of ['user', 'agent', 'memory', 'project']) {
       const text = this.store.readText(target)
-      if (text.trim().length > 0) parts.push(`===== ${target}.md =====\n${cap(text, 3000)}`)
+      if (text.trim().length > 0) files.push({ label: `${target}.md`, text })
     }
     for (const date of this.store.dailyDates().slice(0, DAILY_EXTRACT_DAYS)) {
       const text = this.store.readText('daily', date)
-      if (text.trim().length > 0) parts.push(`===== daily/${date}.md =====\n${cap(text, 2000)}`)
+      if (text.trim().length > 0) files.push({ label: `daily/${date}.md`, text })
     }
-    return parts.join('\n\n')
+    return buildDreamPrompt(files)
   }
 
   private applyConsolidated(target: string, content: string): void {
@@ -440,9 +439,6 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`
 }
 
-function cap(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}…（截断）`
-}
 
 function isCorrection(text: string): boolean {
   return CORRECTION_PATTERNS.some(pattern => pattern.test(text))
